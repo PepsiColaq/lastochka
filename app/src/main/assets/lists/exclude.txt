@@ -1,0 +1,11 @@
+# Domains that should never be processed by DPI bypass
+localhost
+cloudflare.com
+cloudflare-ech.com
+cloudflareaccess.com
+cloudflareapps.com
+cloudflareclient.com
+cloudflareinsights.com
+cloudflarestream.com
+cloudflarestorage.com
+cloudfront.net
