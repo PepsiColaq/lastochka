@@ -25,6 +25,7 @@ object StrategyPresets {
     const val PREF_STRATEGY_ID = "obhod_strategy_id"
     const val PREF_AUTO_NETWORK = "obhod_auto_network_strategy"
     const val PREF_TG_WS = "obhod_tg_ws_enabled"
+    const val PREF_AUTO_START = "obhod_auto_start_vpn"
 
     /** Default — works on Tele2; also a solid baseline for other RU LTE/Wi‑Fi. */
     val Universal = StrategyPreset(
@@ -106,14 +107,20 @@ object StrategyPresets {
                         HostListManager.GEMINI_DOMAINS.map { d -> d.lowercase() }.distinct().sorted().joinToString("\n"),
                     )
                 }
-                // Order: Discord mild → Gemini tunnel-only (no desync) → YT multisplit → passthrough
+                val metaFile = File(HostListManager.listsDir(context), "meta.txt").also {
+                    it.writeText(
+                        HostListManager.META_DOMAINS.map { d -> d.lowercase() }.distinct().sorted().joinToString("\n"),
+                    )
+                }
+                // Order: Discord mild → Gemini pass → Meta/X soft → YT multisplit → passthrough
                 val ytPart = preset.cmdArgs.removePrefix("-U ").trimStart()
                 cmd = "-U " +
                     "-H ${discordFile.absolutePath} -d1+s -s1+s " +
                     "-An -H ${geminiFile.absolutePath} " +
+                    "-An -H ${metaFile.absolutePath} -d1+s -s1+s " +
                     "-An -H ${desyncFile.absolutePath} $ytPart " +
                     "-An"
-                Log.i(TAG, "strategy=${preset.id} discord+gemini-pass+yt+passthrough")
+                Log.i(TAG, "strategy=${preset.id} discord+gemini+meta-soft+yt")
             } catch (e: Exception) {
                 Log.w(TAG, "whitelist write", e)
             }

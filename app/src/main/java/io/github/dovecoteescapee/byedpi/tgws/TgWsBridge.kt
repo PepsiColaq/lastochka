@@ -7,23 +7,38 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.util.Log
 import io.github.dovecoteescapee.byedpi.obhod.StrategyPresets
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.security.SecureRandom
 
 /**
  * Starts local MTProto→WebSocket bridge on 127.0.0.1:1082.
  * Telegram apps are excluded from the VPN and pointed at this proxy via tg://proxy.
+ *
+ * Watchdog restarts the native proxy if the listen port dies (common CF blip).
  */
 object TgWsBridge {
     private const val TAG = "TgWsBridge"
     const val PORT = 1082
     private const val PREF_SECRET = "tg_ws_secret_key"
     private const val PREF_APPLIED = "tg_ws_proxy_applied"
+    private const val WATCH_MS = 4_000L
 
     @Volatile
     var running: Boolean = false
         private set
 
     private var lastPrefixedSecret: String? = null
+    private var watchJob: Job? = null
+    private val startMutex = Mutex()
 
     val telegramPackages = listOf(
         "org.telegram.messenger",
@@ -50,21 +65,35 @@ object TgWsBridge {
         return generated
     }
 
-    @Synchronized
-    fun start(context: Context, prefs: SharedPreferences): Boolean {
+    suspend fun start(context: Context, prefs: SharedPreferences): Boolean = startMutex.withLock {
         if (!isEnabled(prefs)) {
             Log.i(TAG, "TG WS disabled in prefs")
             return false
         }
-        if (running) return true
+        if (running && isPortOpen()) return true
         return try {
+            if (running) {
+                // Stale flag — native died
+                try {
+                    NativeTgWs.stopProxy()
+                } catch (_: Throwable) {
+                }
+                running = false
+            }
             val secret = ensureSecret(prefs)
-            NativeTgWs.setPoolSize(4)
+            NativeTgWs.setPoolSize(8)
             NativeTgWs.setCfProxyCacheDir(context.cacheDir.absolutePath)
             NativeTgWs.setCfProxyConfig(enabled = true, priority = true, userDomain = "")
-            val code = NativeTgWs.startProxy("127.0.0.1", PORT, "", secret, 1)
+            val code = NativeTgWs.startProxy("127.0.0.1", PORT, "", secret, 0)
             if (code != 0) {
                 Log.e(TAG, "StartProxy failed code=$code")
+                running = false
+                return false
+            }
+            // Give native a moment to bind
+            delay(200)
+            if (!isPortOpen()) {
+                Log.e(TAG, "StartProxy ok but port $PORT not listening")
                 running = false
                 return false
             }
@@ -79,9 +108,39 @@ object TgWsBridge {
         }
     }
 
-    @Synchronized
+    fun startWatchdog(scope: CoroutineScope, context: Context, prefs: SharedPreferences) {
+        watchJob?.cancel()
+        watchJob = scope.launch(Dispatchers.IO) {
+            var fails = 0
+            while (isActive && isEnabled(prefs)) {
+                delay(WATCH_MS)
+                if (!running) continue
+                if (isPortOpen()) {
+                    fails = 0
+                    continue
+                }
+                fails++
+                Log.w(TAG, "TG WS port down (fail=$fails) — restarting")
+                running = false
+                val ok = start(context, prefs)
+                if (ok) {
+                    fails = 0
+                    Log.i(TAG, "TG WS auto-restarted")
+                } else if (fails >= 3) {
+                    delay(8_000)
+                }
+            }
+        }
+    }
+
+    fun stopWatchdog() {
+        watchJob?.cancel()
+        watchJob = null
+    }
+
     fun stop() {
-        if (!running) return
+        stopWatchdog()
+        if (!running && !isPortOpen()) return
         try {
             NativeTgWs.stopProxy()
         } catch (e: Throwable) {
@@ -89,6 +148,16 @@ object TgWsBridge {
         }
         running = false
         Log.i(TAG, "TG WS stopped")
+    }
+
+    fun isPortOpen(): Boolean = try {
+        Socket().use { s ->
+            s.soTimeout = 300
+            s.connect(InetSocketAddress("127.0.0.1", PORT), 300)
+            true
+        }
+    } catch (_: Exception) {
+        false
     }
 
     fun proxyUri(prefs: SharedPreferences): Uri {
@@ -100,7 +169,8 @@ object TgWsBridge {
 
     /** Opens Telegram proxy settings only when forced (manual button). Never auto. */
     fun offerApplyInTelegram(context: Context, prefs: SharedPreferences, force: Boolean = false) {
-        if (!isEnabled(prefs) || !running) return
+        if (!isEnabled(prefs)) return
+        if (!running && !isPortOpen()) return
         if (!force && prefs.getBoolean(PREF_APPLIED, false)) {
             Log.i(TAG, "TG proxy already applied — skip auto-open")
             return

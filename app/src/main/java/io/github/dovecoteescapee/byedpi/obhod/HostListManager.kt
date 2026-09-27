@@ -50,11 +50,7 @@ object HostListManager {
         "gvt1.com", "gvt2.com",
         "youtube-nocookie.com", "youtubei.googleapis.com", "youtubekids.com",
         "yt3.ggpht.com", "wide-youtube.l.google.com", "youtubeembeddedplayer.googleapis.com",
-        // Instagram / Facebook / Threads / Meta
-        "instagram.com", "cdninstagram.com", "facebook.com", "fbcdn.net",
-        "fb.com", "meta.com", "threads.net", "threads.com", "messenger.com",
-        // X / Twitter
-        "twitter.com", "x.com", "twimg.com", "t.co", "pscp.tv",
+        // Instagram / X — soft group (see META_DOMAINS), not harsh YT multisplit
         // Reddit / LinkedIn / Medium / GitHub / Stack
         "reddit.com", "redd.it", "redditmedia.com", "redditstatic.com",
         "linkedin.com", "licdn.com", "medium.com",
@@ -94,9 +90,26 @@ object HostListManager {
     )
 
     /**
-     * Google Gemini / Assistant — Tele2 multisplit often hangs on «Подождите».
-     * Soft disorder only; must be matched BEFORE YouTube desync group.
+     * Instagram / Meta / X — harsh YouTube multisplit often breaks their edges.
+     * Soft disorder before desync group (first -H match wins).
      */
+    val META_DOMAINS = listOf(
+        // Instagram
+        "instagram.com", "cdninstagram.com", "ig.me", "igsonar.com",
+        "i.instagram.com", "b.i.instagram.com", "graph.instagram.com",
+        "gateway.instagram.com", "scontent.cdninstagram.com",
+        // Facebook / Meta / Threads
+        "facebook.com", "fbcdn.net", "fb.com", "meta.com", "fb.me",
+        "messenger.com", "threads.net", "threads.com",
+        "graph.facebook.com", "b-graph.facebook.com",
+        "edge-mqtt.facebook.com", "mqtt-mini.facebook.com",
+        "z-m-graph.facebook.com", "web.facebook.com", "m.facebook.com",
+        // X / Twitter
+        "twitter.com", "x.com", "twimg.com", "t.co", "pscp.tv", "periscope.tv",
+        "api.twitter.com", "api.x.com", "abs.twimg.com", "pbs.twimg.com",
+        "video.twimg.com", "ton.twimg.com", "mobile.twitter.com",
+        "tweetdeck.twitter.com",
+    )
     /**
      * Google Gemini / Assistant — harsh YT multisplit breaks these APIs.
      * Matched BEFORE desync group; no TLS desync (tunnel only).
@@ -187,6 +200,7 @@ object HostListManager {
         all.addAll(buildDesyncDomains(context))
         DISCORD_DOMAINS.forEach { all.add(it.lowercase()) }
         GEMINI_DOMAINS.forEach { all.add(it.lowercase()) }
+        META_DOMAINS.forEach { all.add(it.lowercase()) }
         TELEGRAM_EXTRA.forEach { all.add(it.lowercase()) }
         return all.sorted().joinToString("\n")
     }
@@ -207,11 +221,19 @@ object HostListManager {
         val exclude = parseDomains(File(dir, "exclude.txt")).toSet()
         val discord = DISCORD_DOMAINS.map { it.lowercase() }.toSet()
         val gemini = GEMINI_DOMAINS.map { it.lowercase() }.toSet()
+        val meta = META_DOMAINS.map { it.lowercase() }.toSet()
         return domains
             .filter { it !in exclude && it != "localhost" }
             .filter { !it.contains("cloudflare") && it != "cloudfront.net" }
             .filter { it !in discord && !it.contains("discord") }
             .filter { it !in gemini }
+            .filter { d -> !meta.any { m -> d == m || d.endsWith(".$m") } }
+            .filter { d ->
+                // Catch CDN variants from community lists
+                !d.contains("instagram") && !d.contains("facebook") &&
+                    !d.contains("fbcdn") && !d.endsWith(".x.com") &&
+                    !d.contains("twimg") && d != "t.co" && d != "twitter.com"
+            }
             .toSet()
     }
 

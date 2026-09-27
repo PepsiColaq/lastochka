@@ -39,6 +39,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
@@ -91,10 +92,17 @@ class MainActivity : ComponentActivity() {
     private var uiRunning by mutableStateOf(false)
     private var uiStrategyId by mutableStateOf(StrategyPresets.Universal.id)
     private var uiAutoNetwork by mutableStateOf(false)
+    private var uiAutoStart by mutableStateOf(false)
     private var uiTgWs by mutableStateOf(true)
     private var uiStatusHint by mutableStateOf("Выключено")
     private var uiListsHint by mutableStateOf("")
     private var uiDarkTheme by mutableStateOf(true)
+    private var uiUpdateRelease by mutableStateOf<AppUpdater.ReleaseInfo?>(null)
+    private var uiUpdateDownloading by mutableStateOf(false)
+    private var uiUpdateProgress by mutableStateOf(0f)
+    private var uiUpdateSpeed by mutableStateOf("")
+    private var uiUpdateLabel by mutableStateOf("")
+    private var uiWhatsNew by mutableStateOf<String?>(null)
 
     private val vpnRegister =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -132,8 +140,10 @@ class MainActivity : ComponentActivity() {
         uiStrategyId = prefs.getString(StrategyPresets.PREF_STRATEGY_ID, StrategyPresets.Universal.id)
             ?: StrategyPresets.Universal.id
         uiAutoNetwork = prefs.getBoolean(StrategyPresets.PREF_AUTO_NETWORK, false)
+        uiAutoStart = prefs.getBoolean(StrategyPresets.PREF_AUTO_START, false)
         uiTgWs = prefs.getBoolean(StrategyPresets.PREF_TG_WS, true)
         uiDarkTheme = prefs.getBoolean("obhod_dark_theme", true)
+        uiWhatsNew = AppUpdater.consumeWhatsNew(this)
 
         HostListManager.ensureBundledLists(this)
 
@@ -178,8 +188,15 @@ class MainActivity : ComponentActivity() {
                     listsHint = uiListsHint,
                     strategyId = uiStrategyId,
                     autoNetwork = uiAutoNetwork,
+                    autoStart = uiAutoStart,
                     tgWs = uiTgWs,
                     darkTheme = uiDarkTheme,
+                    updateRelease = uiUpdateRelease,
+                    updateDownloading = uiUpdateDownloading,
+                    updateProgress = uiUpdateProgress,
+                    updateSpeed = uiUpdateSpeed,
+                    updateLabel = uiUpdateLabel,
+                    whatsNew = uiWhatsNew,
                     onToggle = { toggleBypass() },
                     onStrategyChange = { id ->
                         uiStrategyId = id
@@ -257,6 +274,12 @@ class MainActivity : ComponentActivity() {
                             Toast.makeText(this, "Ошибка авто-режима", Toast.LENGTH_SHORT).show()
                         }
                     },
+                    onAutoStartChange = { enabled ->
+                        uiAutoStart = enabled
+                        getPreferences().edit()
+                            .putBoolean(StrategyPresets.PREF_AUTO_START, enabled)
+                            .apply()
+                    },
                     onTgWsChange = { enabled ->
                         uiTgWs = enabled
                         getPreferences().edit()
@@ -306,6 +329,9 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     onCheckUpdate = { checkAppUpdate(force = true) },
+                    onInstallUpdate = { startUpdateDownload() },
+                    onDismissUpdate = { uiUpdateRelease = null },
+                    onDismissWhatsNew = { uiWhatsNew = null },
                     onOpenLegacySettings = {
                         if (appStatus.first != AppStatus.Running) {
                             startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
@@ -322,9 +348,20 @@ class MainActivity : ComponentActivity() {
         }
 
         refreshUiStatus()
+        // Auto-start bypass when user enabled the switch
+        if (uiAutoStart && appStatus.first != AppStatus.Running) {
+            prepareAndStart()
+        }
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                AppUpdater.checkForUpdate(this@MainActivity, force = false)
+                val result = AppUpdater.checkForUpdate(this@MainActivity, force = false)
+                val release = result.release
+                if (release != null) {
+                    withContext(Dispatchers.Main) {
+                        uiUpdateRelease = release
+                        AppUpdater.notifyUpdateAvailable(this@MainActivity, release)
+                    }
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "quiet update check", e)
             }
@@ -342,56 +379,55 @@ class MainActivity : ComponentActivity() {
             withContext(Dispatchers.Main) {
                 val release = result.release
                 if (release != null) {
-                    android.app.AlertDialog.Builder(this@MainActivity)
-                        .setTitle("Обновление ${release.versionName}")
-                        .setMessage(
-                            buildString {
-                                append("Установить новую версию Ласточки?")
-                                if (release.notes.isNotBlank()) {
-                                    append("\n\n")
-                                    append(release.notes.take(400))
-                                }
-                            },
-                        )
-                        .setPositiveButton("Скачать") { _, _ ->
-                            lifecycleScope.launch(Dispatchers.IO) {
-                                withContext(Dispatchers.Main) {
-                                    Toast.makeText(
-                                        this@MainActivity,
-                                        "Скачиваю…",
-                                        Toast.LENGTH_SHORT,
-                                    ).show()
-                                }
-                                val apk = AppUpdater.downloadApk(this@MainActivity, release.apkUrl)
-                                withContext(Dispatchers.Main) {
-                                    if (apk == null) {
-                                        Toast.makeText(
-                                            this@MainActivity,
-                                            "Не удалось скачать. Включите обход и повторите.",
-                                            Toast.LENGTH_LONG,
-                                        ).show()
-                                    } else {
-                                        val started = AppUpdater.installApk(this@MainActivity, apk)
-                                        if (!started) {
-                                            Toast.makeText(
-                                                this@MainActivity,
-                                                "Разрешите установку из этого приложения",
-                                                Toast.LENGTH_LONG,
-                                            ).show()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        .setNegativeButton("Позже", null)
-                        .setNeutralButton("На сайте") { _, _ ->
-                            startActivity(
-                                Intent(Intent.ACTION_VIEW, android.net.Uri.parse(release.htmlUrl)),
-                            )
-                        }
-                        .show()
+                    uiUpdateRelease = release
+                    AppUpdater.notifyUpdateAvailable(this@MainActivity, release)
                 } else {
                     Toast.makeText(this@MainActivity, result.message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun startUpdateDownload() {
+        val release = uiUpdateRelease ?: return
+        if (uiUpdateDownloading) return
+        uiUpdateDownloading = true
+        uiUpdateProgress = 0f
+        uiUpdateSpeed = ""
+        uiUpdateLabel = "Скачиваю…"
+        lifecycleScope.launch(Dispatchers.IO) {
+            AppUpdater.rememberWhatsNew(this@MainActivity, release)
+            val apk = AppUpdater.downloadApk(this@MainActivity, release.apkUrl) { p ->
+                val frac = if (p.total > 0) {
+                    (p.downloaded.toFloat() / p.total.toFloat()).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+                uiUpdateProgress = frac
+                uiUpdateSpeed = AppUpdater.formatSpeed(p.bytesPerSec)
+                uiUpdateLabel =
+                    "${AppUpdater.formatBytes(p.downloaded)} / ${AppUpdater.formatBytes(p.total)}"
+            }
+            withContext(Dispatchers.Main) {
+                uiUpdateDownloading = false
+                if (apk == null) {
+                    uiUpdateLabel = ""
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Не удалось скачать. Включите обход и повторите.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                } else {
+                    uiUpdateProgress = 1f
+                    uiUpdateLabel = "Готово — установка"
+                    val started = AppUpdater.installApk(this@MainActivity, apk)
+                    if (!started) {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Разрешите установку из этого приложения",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
                 }
             }
         }
@@ -499,16 +535,27 @@ private fun ObhodScreen(
     listsHint: String,
     strategyId: String,
     autoNetwork: Boolean,
+    autoStart: Boolean,
     tgWs: Boolean,
     darkTheme: Boolean,
+    updateRelease: AppUpdater.ReleaseInfo?,
+    updateDownloading: Boolean,
+    updateProgress: Float,
+    updateSpeed: String,
+    updateLabel: String,
+    whatsNew: String?,
     onToggle: () -> Unit,
     onStrategyChange: (String) -> Unit,
     onAutoNetworkChange: (Boolean) -> Unit,
+    onAutoStartChange: (Boolean) -> Unit,
     onTgWsChange: (Boolean) -> Unit,
     onApplyTelegram: () -> Unit,
     onDarkThemeChange: (Boolean) -> Unit,
     onRefreshLists: () -> Unit,
     onCheckUpdate: () -> Unit,
+    onInstallUpdate: () -> Unit,
+    onDismissUpdate: () -> Unit,
+    onDismissWhatsNew: () -> Unit,
     onOpenLegacySettings: () -> Unit,
 ) {
     var showStrategyDialog by remember { mutableStateOf(false) }
@@ -534,6 +581,68 @@ private fun ObhodScreen(
     val bgBot = if (darkTheme) Color(0xFF15201C) else Color(0xFFC5D4C8)
     val muted = if (darkTheme) Color(0xFF9AAEA6) else Color(0xFF5A6A64)
     val cardBg = if (darkTheme) Color(0xCC1A2220) else Color(0xCCF7FAFC)
+
+    if (whatsNew != null) {
+        AlertDialog(
+            onDismissRequest = onDismissWhatsNew,
+            title = { Text("Что нового") },
+            text = {
+                Text(whatsNew.take(900), fontSize = 14.sp)
+            },
+            confirmButton = {
+                TextButton(onClick = onDismissWhatsNew) { Text("Отлично") }
+            },
+        )
+    }
+
+    if (updateRelease != null) {
+        AlertDialog(
+            onDismissRequest = { if (!updateDownloading) onDismissUpdate() },
+            title = { Text("Обновление ${updateRelease.versionName}") },
+            text = {
+                Column {
+                    Text(
+                        "Доступна новая версия Ласточки.",
+                        fontWeight = FontWeight.Medium,
+                    )
+                    if (updateRelease.notes.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text("Что нового:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text(updateRelease.notes.take(700), fontSize = 12.sp, color = muted)
+                    }
+                    if (updateDownloading || updateProgress > 0f) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        LinearProgressIndicator(
+                            progress = { updateProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(updateLabel.ifBlank { "…" }, fontSize = 12.sp, color = muted)
+                            Text(updateSpeed, fontSize = 12.sp, color = Color(0xFF7DCFB6))
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = onInstallUpdate,
+                    enabled = !updateDownloading,
+                ) {
+                    Text(if (updateDownloading) "Скачиваю…" else "Установить")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = onDismissUpdate,
+                    enabled = !updateDownloading,
+                ) { Text("Позже") }
+            },
+        )
+    }
 
     if (showStrategyDialog && !autoNetwork) {
         AlertDialog(
@@ -651,6 +760,24 @@ private fun ObhodScreen(
                             Text("Меньше белого на экране", fontSize = 12.sp, color = muted)
                         }
                         Switch(checked = darkTheme, onCheckedChange = onDarkThemeChange)
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Автозапуск обхода", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "При открытии Ласточки сразу включает VPN",
+                                fontSize = 12.sp,
+                                color = muted,
+                            )
+                        }
+                        Switch(checked = autoStart, onCheckedChange = onAutoStartChange)
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))

@@ -1,14 +1,20 @@
 package io.github.dovecoteescapee.byedpi.obhod
 
 import android.app.Activity
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import io.github.dovecoteescapee.byedpi.BuildConfig
+import io.github.dovecoteescapee.byedpi.R
+import io.github.dovecoteescapee.byedpi.activities.MainActivity
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -23,10 +29,12 @@ import java.util.concurrent.TimeUnit
  */
 object AppUpdater {
     private const val TAG = "AppUpdater"
-    /** owner/repo — filled after first public release; override via prefs if needed */
     const val DEFAULT_REPO = "PepsiColaq/lastochka"
     private const val PREF_REPO = "obhod_update_repo"
     private const val PREF_LAST_CHECK = "obhod_update_last_check"
+    private const val PREF_WHATS_NEW = "obhod_whats_new_pending"
+    private const val PREF_WHATS_NEW_CODE = "obhod_whats_new_code"
+    private const val PREF_SEEN_WHATS_NEW = "obhod_whats_new_seen_code"
 
     data class ReleaseInfo(
         val versionName: String,
@@ -34,12 +42,19 @@ object AppUpdater {
         val apkUrl: String,
         val htmlUrl: String,
         val notes: String,
+        val apkSizeBytes: Long = 0L,
     )
 
     data class CheckResult(
         val ok: Boolean,
         val message: String,
         val release: ReleaseInfo? = null,
+    )
+
+    data class DownloadProgress(
+        val downloaded: Long,
+        val total: Long,
+        val bytesPerSec: Long,
     )
 
     fun repoSlug(context: Context): String {
@@ -90,16 +105,20 @@ object AppUpdater {
             val json = JSONObject(body)
             val tag = json.optString("tag_name", "").removePrefix("v").trim()
             val html = json.optString("html_url", "")
-            val notes = json.optString("body", "").take(500)
+            val notes = json.optString("body", "").take(1200)
             val assets = json.optJSONArray("assets") ?: return CheckResult(true, "Обновлений нет")
             var apkUrl = ""
+            var apkSize = 0L
             var codeFromAsset = 0
             for (i in 0 until assets.length()) {
                 val a = assets.getJSONObject(i)
                 val name = a.optString("name", "")
                 val url = a.optString("browser_download_url", "")
                 when {
-                    name.endsWith(".apk", ignoreCase = true) && apkUrl.isEmpty() -> apkUrl = url
+                    name.endsWith(".apk", ignoreCase = true) && apkUrl.isEmpty() -> {
+                        apkUrl = url
+                        apkSize = a.optLong("size", 0L)
+                    }
                     name.equals("version.json", ignoreCase = true) -> {
                         val vBody = proxies.firstNotNullOfOrNull { httpGet(url, it) }
                         if (!vBody.isNullOrBlank()) {
@@ -130,6 +149,7 @@ object AppUpdater {
                     apkUrl = apkUrl,
                     htmlUrl = html,
                     notes = notes,
+                    apkSizeBytes = apkSize,
                 ),
             )
         } catch (e: Exception) {
@@ -138,7 +158,11 @@ object AppUpdater {
         }
     }
 
-    fun downloadApk(context: Context, apkUrl: String): File? {
+    fun downloadApk(
+        context: Context,
+        apkUrl: String,
+        onProgress: ((DownloadProgress) -> Unit)? = null,
+    ): File? {
         val prefs = context.getSharedPreferences(
             context.packageName + "_preferences",
             Context.MODE_PRIVATE,
@@ -162,8 +186,33 @@ object AppUpdater {
                 }
                 try {
                     if (conn.responseCode !in 200..299) continue
+                    val total = conn.contentLengthLong.coerceAtLeast(0L)
+                    var downloaded = 0L
+                    var windowBytes = 0L
+                    var windowStart = System.nanoTime()
                     conn.inputStream.use { input ->
-                        out.outputStream().use { output -> input.copyTo(output) }
+                        out.outputStream().use { output ->
+                            val buf = ByteArray(64 * 1024)
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n <= 0) break
+                                output.write(buf, 0, n)
+                                downloaded += n
+                                windowBytes += n
+                                val now = System.nanoTime()
+                                val elapsedNs = now - windowStart
+                                if (elapsedNs >= 250_000_000L || downloaded == total) {
+                                    val bps = if (elapsedNs > 0) {
+                                        (windowBytes * 1_000_000_000L) / elapsedNs
+                                    } else {
+                                        0L
+                                    }
+                                    onProgress?.invoke(DownloadProgress(downloaded, total, bps))
+                                    windowBytes = 0
+                                    windowStart = now
+                                }
+                            }
+                        }
                     }
                     if (out.length() > 100_000) return out
                 } finally {
@@ -174,6 +223,28 @@ object AppUpdater {
             }
         }
         return null
+    }
+
+    fun rememberWhatsNew(context: Context, release: ReleaseInfo) {
+        context.getSharedPreferences(context.packageName + "_preferences", Context.MODE_PRIVATE)
+            .edit()
+            .putString(PREF_WHATS_NEW, release.notes.ifBlank { "Обновление ${release.versionName}" })
+            .putInt(PREF_WHATS_NEW_CODE, release.versionCode)
+            .apply()
+    }
+
+    /** Show once after user installs a newer build. */
+    fun consumeWhatsNew(context: Context): String? {
+        val prefs = context.getSharedPreferences(
+            context.packageName + "_preferences",
+            Context.MODE_PRIVATE,
+        )
+        val code = prefs.getInt(PREF_WHATS_NEW_CODE, -1)
+        val seen = prefs.getInt(PREF_SEEN_WHATS_NEW, -1)
+        if (code != BuildConfig.VERSION_CODE || code == seen) return null
+        val notes = prefs.getString(PREF_WHATS_NEW, null)?.takeIf { it.isNotBlank() } ?: return null
+        prefs.edit().putInt(PREF_SEEN_WHATS_NEW, code).apply()
+        return notes
     }
 
     fun installApk(activity: Activity, apk: File): Boolean {
@@ -200,6 +271,49 @@ object AppUpdater {
         }
         activity.startActivity(intent)
         return true
+    }
+
+    fun notifyUpdateAvailable(context: Context, release: ReleaseInfo) {
+        val channelId = "lastochka_updates"
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    channelId,
+                    "Обновления Ласточки",
+                    NotificationManager.IMPORTANCE_DEFAULT,
+                ).apply {
+                    description = "Когда выходит новая версия приложения"
+                    setShowBadge(false)
+                },
+            )
+        }
+        val open = PendingIntent.getActivity(
+            context,
+            40,
+            Intent(context, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val n = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Доступна Ласточка ${release.versionName}")
+            .setContentText("Нажмите, чтобы обновить приложение")
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .build()
+        nm.notify(40, n)
+    }
+
+    fun formatSpeed(bytesPerSec: Long): String {
+        val mb = bytesPerSec / (1024.0 * 1024.0)
+        return if (mb >= 0.1) "%.1f МБ/с".format(mb) else "%.0f КБ/с".format(bytesPerSec / 1024.0)
+    }
+
+    fun formatBytes(bytes: Long): String {
+        if (bytes <= 0) return "?"
+        val mb = bytes / (1024.0 * 1024.0)
+        return if (mb >= 1) "%.1f МБ".format(mb) else "%.0f КБ".format(bytes / 1024.0)
     }
 
     private fun isNewerName(remote: String, local: String): Boolean {

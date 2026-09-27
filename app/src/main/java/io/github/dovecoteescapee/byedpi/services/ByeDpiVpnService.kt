@@ -92,12 +92,15 @@ class ByeDpiVpnService : LifecycleVpnService() {
                 startProxy()
                 startTun2Socks()
             }
-            // TG WS outside VPN mutex — failure must not kill YouTube path
+            // TG WS + watchdog (CF blips used to leave Telegram on a dead proxy)
             val prefs = getPreferences()
             if (TgWsBridge.isEnabled(prefs)) {
                 lifecycleScope.launch(Dispatchers.IO) {
                     val ok = TgWsBridge.start(this@ByeDpiVpnService, prefs)
                     Log.i(TAG, "TG WS start result=$ok running=${TgWsBridge.running}")
+                    if (ok) {
+                        TgWsBridge.startWatchdog(lifecycleScope, this@ByeDpiVpnService, prefs)
+                    }
                 }
             }
             updateStatus(ServiceStatus.Connected)
