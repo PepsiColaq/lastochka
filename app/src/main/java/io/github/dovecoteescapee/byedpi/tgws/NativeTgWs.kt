@@ -31,7 +31,6 @@ object NativeTgWs {
         try {
             System.setProperty("jna.nosys", "true")
             System.setProperty("jna.nounpack", "true")
-            // Prefer explicit System.loadLibrary so Android ClassLoader finds jniLibs
             try {
                 System.loadLibrary("jnidispatch")
             } catch (_: Throwable) { /* JNA may load it */ }
@@ -81,6 +80,23 @@ object NativeTgWs {
             ptr.getString(0)
         } finally {
             ensureLoaded().FreeString(ptr)
+        }
+    }
+
+    /** Native stats string, e.g. `active=1 ws=2 tcp_fb=0 cf=3 bad=0 err=1`. */
+    fun getStats(): String? {
+        val ptr = try {
+            lib?.GetStats()
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        return try {
+            ptr.getString(0)
+        } finally {
+            try {
+                ensureLoaded().FreeString(ptr)
+            } catch (_: Throwable) {
+            }
         }
     }
 }

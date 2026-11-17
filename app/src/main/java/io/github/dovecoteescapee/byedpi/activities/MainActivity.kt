@@ -42,6 +42,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -103,6 +104,10 @@ class MainActivity : ComponentActivity() {
     private var uiUpdateSpeed by mutableStateOf("")
     private var uiUpdateLabel by mutableStateOf("")
     private var uiWhatsNew by mutableStateOf<String?>(null)
+    private var uiCfDomain by mutableStateOf("")
+    private var uiTgInTunnel by mutableStateOf(false)
+    private var uiDiagnostics by mutableStateOf<List<String>?>(null)
+    private var uiDiagnosing by mutableStateOf(false)
 
     private val vpnRegister =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -144,6 +149,8 @@ class MainActivity : ComponentActivity() {
         uiTgWs = prefs.getBoolean(StrategyPresets.PREF_TG_WS, true)
         uiDarkTheme = prefs.getBoolean("obhod_dark_theme", true)
         uiWhatsNew = AppUpdater.consumeWhatsNew(this)
+        uiCfDomain = prefs.getString(StrategyPresets.PREF_CF_USER_DOMAIN, "") ?: ""
+        uiTgInTunnel = prefs.getBoolean(StrategyPresets.PREF_TG_IN_TUNNEL, false)
 
         HostListManager.ensureBundledLists(this)
 
@@ -197,6 +204,10 @@ class MainActivity : ComponentActivity() {
                     updateSpeed = uiUpdateSpeed,
                     updateLabel = uiUpdateLabel,
                     whatsNew = uiWhatsNew,
+                    cfDomain = uiCfDomain,
+                    tgInTunnel = uiTgInTunnel,
+                    diagnostics = uiDiagnostics,
+                    diagnosing = uiDiagnosing,
                     onToggle = { toggleBypass() },
                     onStrategyChange = { id ->
                         uiStrategyId = id
@@ -285,18 +296,117 @@ class MainActivity : ComponentActivity() {
                         getPreferences().edit()
                             .putBoolean(StrategyPresets.PREF_TG_WS, enabled)
                             .apply()
-                        if (enabled && uiRunning) {
+                        if (!uiRunning) return@ObhodScreen
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            val bridge = io.github.dovecoteescapee.byedpi.tgws.TgWsBridge
+                            if (enabled) {
+                                val ok = bridge.start(this@MainActivity, getPreferences())
+                                if (ok) {
+                                    bridge.startWatchdog(
+                                        lifecycleScope,
+                                        this@MainActivity,
+                                        getPreferences(),
+                                    )
+                                }
+                                withContext(Dispatchers.Main) {
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        if (ok) "Прокси Telegram запущен"
+                                        else "Не удалось запустить прокси TG",
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                }
+                            } else {
+                                bridge.stop()
+                            }
+                        }
+                    },
+                    onApplyTelegram = {
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            val bridge = io.github.dovecoteescapee.byedpi.tgws.TgWsBridge
+                            if (!uiRunning) {
+                                withContext(Dispatchers.Main) {
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        "Сначала включите обход",
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                }
+                                return@launch
+                            }
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "Подключаем прокси…",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                            val result = bridge.prepareApplyInTelegram(
+                                this@MainActivity,
+                                getPreferences(),
+                                force = true,
+                            )
+                            withContext(Dispatchers.Main) {
+                                if (!result.ok || result.uri == null) {
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        result.message,
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                    return@withContext
+                                }
+                                val opened = bridge.openInTelegram(this@MainActivity, result.uri)
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    if (opened) "Подтвердите прокси в Telegram"
+                                    else "Не удалось открыть Telegram. Установите TG?",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                        }
+                    },
+                    onDiagnose = {
+                        if (uiDiagnosing) return@ObhodScreen
+                        uiDiagnosing = true
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            val lines = try {
+                                io.github.dovecoteescapee.byedpi.tgws.TgWsBridge.diagnose(
+                                    this@MainActivity,
+                                    getPreferences(),
+                                )
+                            } catch (e: Exception) {
+                                Log.w(TAG, "diagnose failed", e)
+                                listOf("Ошибка диагностики: ${e.message ?: "?"}")
+                            }
+                            withContext(Dispatchers.Main) {
+                                uiDiagnostics = lines
+                                uiDiagnosing = false
+                            }
+                        }
+                    },
+                    onCfDomainChange = { value ->
+                        uiCfDomain = value
+                        getPreferences().edit()
+                            .putString(StrategyPresets.PREF_CF_USER_DOMAIN, value.trim())
+                            .apply()
+                    },
+                    onTgTunnelChange = { enabled ->
+                        uiTgInTunnel = enabled
+                        getPreferences().edit()
+                            .putBoolean(StrategyPresets.PREF_TG_IN_TUNNEL, enabled)
+                            .apply()
+                        if (enabled) {
+                            io.github.dovecoteescapee.byedpi.tgws.TgWsBridge.stop()
+                        }
+                        if (uiRunning) {
                             Toast.makeText(
-                                this,
-                                "Перезапустите обход, чтобы применить Telegram WS",
+                                this@MainActivity,
+                                "Перезапустите обход, чтобы применить",
                                 Toast.LENGTH_SHORT,
                             ).show()
                         }
                     },
-                    onApplyTelegram = {
-                        io.github.dovecoteescapee.byedpi.tgws.TgWsBridge
-                            .offerApplyInTelegram(this, getPreferences(), force = true)
-                    },
+
                     onDarkThemeChange = { dark ->
                         uiDarkTheme = dark
                         getPreferences().edit().putBoolean("obhod_dark_theme", dark).apply()
@@ -329,7 +439,13 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     onCheckUpdate = { checkAppUpdate(force = true) },
-                    onInstallUpdate = { startUpdateDownload() },
+                    onInstallUpdate = {
+                        if (AppUpdater.pendingApk(this@MainActivity) != null) {
+                            tryContinueInstall()
+                        } else {
+                            startUpdateDownload()
+                        }
+                    },
                     onDismissUpdate = { uiUpdateRelease = null },
                     onDismissWhatsNew = { uiWhatsNew = null },
                     onOpenLegacySettings = {
@@ -420,22 +536,55 @@ class MainActivity : ComponentActivity() {
                 } else {
                     uiUpdateProgress = 1f
                     uiUpdateLabel = "Готово — установка"
-                    val started = AppUpdater.installApk(this@MainActivity, apk)
-                    if (!started) {
-                        Toast.makeText(
-                            this@MainActivity,
-                            "Разрешите установку из этого приложения",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    }
+                    AppUpdater.rememberPendingInstall(this@MainActivity, apk, release)
+                    tryContinueInstall()
                 }
             }
+        }
+    }
+
+    /** After permission grant or when APK already cached — keep dialog and install. */
+    private fun tryContinueInstall() {
+        val apk = AppUpdater.pendingApk(this) ?: return
+        val release = AppUpdater.pendingRelease(this)
+        if (release != null) {
+            uiUpdateRelease = release
+            uiUpdateProgress = 1f
+            uiUpdateLabel = "Готово — установка"
+        }
+        if (!AppUpdater.canInstallPackages(this)) {
+            uiUpdateLabel = "Нужно разрешение на установку"
+            AppUpdater.installApk(this, apk) // opens settings
+            Toast.makeText(
+                this,
+                "Разрешите установку и вернитесь — продолжим автоматически",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        val started = AppUpdater.installApk(this, apk)
+        if (started) {
+            AppUpdater.clearPendingInstall(this)
         }
     }
 
     override fun onResume() {
         super.onResume()
         refreshUiStatus()
+        // Keep update dialog after returning from «неизвестные источники»
+        val pendingRel = AppUpdater.pendingRelease(this)
+        val pendingApk = AppUpdater.pendingApk(this)
+        if (pendingRel != null) {
+            uiUpdateRelease = pendingRel
+            if (pendingApk != null) {
+                uiUpdateProgress = 1f
+                uiUpdateLabel = if (AppUpdater.canInstallPackages(this)) {
+                    "Скачано — нажмите «Установить»"
+                } else {
+                    "Нужно разрешение на установку"
+                }
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -465,8 +614,9 @@ class MainActivity : ComponentActivity() {
         // Don't block VPN start on remote list download — local lists are enough
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val hosts = HostListManager.buildWhitelist(this@MainActivity)
                 val prefs = getPreferences()
+                val cfDomain = prefs.getString(StrategyPresets.PREF_CF_USER_DOMAIN, "") ?: ""
+                val hosts = HostListManager.buildWhitelist(this@MainActivity, cfDomain)
                 val preset = if (uiAutoNetwork) {
                     StrategyPresets.recommendForNetwork(this@MainActivity)
                 } else {
@@ -544,12 +694,19 @@ private fun ObhodScreen(
     updateSpeed: String,
     updateLabel: String,
     whatsNew: String?,
+    cfDomain: String,
+    tgInTunnel: Boolean,
+    diagnostics: List<String>?,
+    diagnosing: Boolean,
     onToggle: () -> Unit,
     onStrategyChange: (String) -> Unit,
     onAutoNetworkChange: (Boolean) -> Unit,
     onAutoStartChange: (Boolean) -> Unit,
     onTgWsChange: (Boolean) -> Unit,
     onApplyTelegram: () -> Unit,
+    onDiagnose: () -> Unit,
+    onCfDomainChange: (String) -> Unit,
+    onTgTunnelChange: (Boolean) -> Unit,
     onDarkThemeChange: (Boolean) -> Unit,
     onRefreshLists: () -> Unit,
     onCheckUpdate: () -> Unit,
@@ -597,7 +754,7 @@ private fun ObhodScreen(
 
     if (updateRelease != null) {
         AlertDialog(
-            onDismissRequest = { if (!updateDownloading) onDismissUpdate() },
+            onDismissRequest = { /* keep open — user may return from settings */ },
             title = { Text("Обновление ${updateRelease.versionName}") },
             text = {
                 Column {
@@ -816,8 +973,14 @@ private fun ObhodScreen(
                         Switch(checked = tgWs, onCheckedChange = onTgWsChange)
                     }
 
-                    if (tgWs && running) {
+                    if (tgWs && running && !tgInTunnel) {
                         Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "Мост: ${io.github.dovecoteescapee.byedpi.tgws.TgWsBridge.lastStatus}",
+                            fontSize = 12.sp,
+                            color = muted,
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
                         TextButton(
                             onClick = onApplyTelegram,
                             modifier = Modifier
@@ -831,6 +994,74 @@ private fun ObhodScreen(
                             fontSize = 11.sp,
                             color = muted,
                         )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Telegram через туннель", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Без WS-моста: MTProto идёт через обход. Запасной вариант, " +
+                                    "если прокси не подключается",
+                                fontSize = 12.sp,
+                                color = muted,
+                            )
+                        }
+                        Switch(checked = tgInTunnel, onCheckedChange = onTgTunnelChange)
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Text("Свой Cloudflare-домен", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text(
+                        "Необязательно. Если у тебя есть зона в Cloudflare — впиши её сюда, " +
+                            "это самый надёжный путь для Telegram.",
+                        fontSize = 11.sp,
+                        color = muted,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    OutlinedTextField(
+                        value = cfDomain,
+                        onValueChange = onCfDomainChange,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .semantics { contentDescription = "cf_domain_field" },
+                        singleLine = true,
+                        placeholder = { Text("например myzone.co.uk", fontSize = 13.sp) },
+                        textStyle = MaterialTheme.typography.bodySmall,
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedButton(
+                        onClick = onDiagnose,
+                        enabled = !diagnosing,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .semantics { contentDescription = "diagnose_button" },
+                    ) {
+                        Text(if (diagnosing) "Проверяю…" else "Проверить соединение")
+                    }
+
+                    if (!diagnostics.isNullOrEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (darkTheme) Color(0xFF101815) else Color(0xFFE6EEF2),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                diagnostics.forEach { line ->
+                                    Text(line, fontSize = 12.sp, color = scheme.onSurface)
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                }
+                            }
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))

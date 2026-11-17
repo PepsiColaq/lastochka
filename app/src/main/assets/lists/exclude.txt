@@ -9,3 +9,12 @@ cloudflareinsights.com
 cloudflarestream.com
 cloudflarestorage.com
 cloudfront.net
+# Schedule site (chuikov-rasp) — CF Workers / Supabase / Pages
+# Harsh desync breaks these; keep tunnel-only (passthrough -An)
+workers.dev
+pages.dev
+supabase.co
+github.io
+pepsicolaq.github.io
+azuergqxvqrkvrvqelha.supabase.co
+rasp-supabase-proxy.tourmaline-purchase.workers.dev

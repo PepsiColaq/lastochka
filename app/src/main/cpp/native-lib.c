@@ -294,3 +294,50 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniStopProxy(
     }
     return 0;
 }
+
+/*
+ * setenv/unsetenv for the app process.
+ *
+ * android.system.Os.setenv is a hidden API and is blocked for third-party
+ * apps, so the MTProto->WS bridge (libtgwsproxy.so) cannot be pointed at our
+ * local SOCKS from Kotlin. reqwest inside that library reads ALL_PROXY from
+ * the environment, and setenv() from our own JNI code is the only way to
+ * publish it. Without it the bridge connects direct and the RU DPI kills the
+ * TLS handshake to the Cloudflare front domains.
+ */
+JNIEXPORT jint JNICALL
+Java_io_github_dovecoteescapee_byedpi_core_NativeEnv_jniSetEnv(
+        JNIEnv *env,
+        __attribute__((unused)) jclass clazz,
+        jstring key,
+        jstring value) {
+    if (!key || !value) {
+        return -1;
+    }
+    const char *k = (*env)->GetStringUTFChars(env, key, 0);
+    const char *v = (*env)->GetStringUTFChars(env, value, 0);
+    int res = setenv(k, v, 1);
+    (*env)->ReleaseStringUTFChars(env, key, k);
+    (*env)->ReleaseStringUTFChars(env, value, v);
+    if (res != 0) {
+        uniperror("setenv");
+    }
+    return res;
+}
+
+JNIEXPORT jint JNICALL
+Java_io_github_dovecoteescapee_byedpi_core_NativeEnv_jniUnsetEnv(
+        JNIEnv *env,
+        __attribute__((unused)) jclass clazz,
+        jstring key) {
+    if (!key) {
+        return -1;
+    }
+    const char *k = (*env)->GetStringUTFChars(env, key, 0);
+    int res = unsetenv(k);
+    (*env)->ReleaseStringUTFChars(env, key, k);
+    if (res != 0) {
+        uniperror("unsetenv");
+    }
+    return res;
+}

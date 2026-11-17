@@ -2,8 +2,11 @@ package io.github.dovecoteescapee.byedpi.services
 
 import android.app.Notification
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -14,16 +17,22 @@ import io.github.dovecoteescapee.byedpi.core.ByeDpiProxy
 import io.github.dovecoteescapee.byedpi.core.ByeDpiProxyPreferences
 import io.github.dovecoteescapee.byedpi.core.TProxyService
 import io.github.dovecoteescapee.byedpi.data.*
+import io.github.dovecoteescapee.byedpi.obhod.CfProxyDomains
+import io.github.dovecoteescapee.byedpi.obhod.HostListManager
+import io.github.dovecoteescapee.byedpi.obhod.StrategyPresets
 import io.github.dovecoteescapee.byedpi.utility.*
 import io.github.dovecoteescapee.byedpi.tgws.TgWsBridge
 import io.github.dovecoteescapee.byedpi.obhod.BypassApps
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
 
 class ByeDpiVpnService : LifecycleVpnService() {
     private val byeDpiProxy = ByeDpiProxy()
@@ -31,6 +40,7 @@ class ByeDpiVpnService : LifecycleVpnService() {
     private var tunFd: ParcelFileDescriptor? = null
     private val mutex = Mutex()
     private var stopping: Boolean = false
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     companion object {
         private val TAG: String = ByeDpiVpnService::class.java.simpleName
@@ -90,11 +100,15 @@ class ByeDpiVpnService : LifecycleVpnService() {
         try {
             mutex.withLock {
                 startProxy()
+                // hev-socks5-tunnel needs ByeDPI listening. Without this wait
+                // the TUN could come up before :1080 existed and the first
+                // connections went nowhere.
+                awaitSocksReady()
                 startTun2Socks()
             }
             // TG WS + watchdog (CF blips used to leave Telegram on a dead proxy)
             val prefs = getPreferences()
-            if (TgWsBridge.isEnabled(prefs)) {
+            if (TgWsBridge.isEnabled(prefs) && !tgInTunnel(prefs)) {
                 lifecycleScope.launch(Dispatchers.IO) {
                     val ok = TgWsBridge.start(this@ByeDpiVpnService, prefs)
                     Log.i(TAG, "TG WS start result=$ok running=${TgWsBridge.running}")
@@ -102,14 +116,109 @@ class ByeDpiVpnService : LifecycleVpnService() {
                         TgWsBridge.startWatchdog(lifecycleScope, this@ByeDpiVpnService, prefs)
                     }
                 }
+            } else if (tgInTunnel(prefs)) {
+                Log.i(TAG, "Telegram routed through the tunnel (WS bridge off)")
+                TgWsBridge.stop()
             }
             updateStatus(ServiceStatus.Connected)
             startForeground()
+            registerNetworkCallback()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VPN", e)
             updateStatus(ServiceStatus.Failed)
             stop()
         }
+    }
+
+    /** Poll until the local ByeDPI SOCKS accepts, or give up after 5 s. */
+    private suspend fun awaitSocksReady() {
+        val port = getPreferences().getString("byedpi_proxy_port", null)?.toIntOrNull() ?: 1080
+        val deadline = System.currentTimeMillis() + 5_000L
+        while (System.currentTimeMillis() < deadline) {
+            val ok = try {
+                Socket().use { s ->
+                    s.soTimeout = 300
+                    s.connect(InetSocketAddress("127.0.0.1", port), 300)
+                    true
+                }
+            } catch (_: Exception) {
+                false
+            }
+            if (ok) {
+                Log.i(TAG, "SOCKS :$port ready")
+                return
+            }
+            delay(100)
+        }
+        Log.w(TAG, "SOCKS :$port not ready after 5s, starting TUN anyway")
+    }
+
+    private fun tgInTunnel(prefs: android.content.SharedPreferences): Boolean =
+        prefs.getBoolean(StrategyPresets.PREF_TG_IN_TUNNEL, false)
+
+    /**
+     * Wi-Fi ↔ LTE changes the DPI profile. Re-applying the strategy and
+     * restarting the bridge keeps the app working on both, instead of
+     * silently degrading until the user toggles the switch.
+     */
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (status != ServiceStatus.Connected) return
+                    val prefs = getPreferences()
+                    if (!prefs.getBoolean(StrategyPresets.PREF_AUTO_NETWORK, false)) return
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            CfProxyDomains.invalidate()
+                            val rec = StrategyPresets.recommendForNetwork(this@ByeDpiVpnService)
+                            val hosts = HostListManager.buildWhitelist(this@ByeDpiVpnService)
+                            StrategyPresets.applyToPreferences(
+                                prefs, rec, hosts, this@ByeDpiVpnService,
+                            )
+                            Log.i(TAG, "network change -> strategy ${rec.id}; restarting")
+                            mutex.withLock {
+                                stopTun2Socks()
+                                stopProxy()
+                            }
+                            delay(300)
+                            mutex.withLock {
+                                startProxy()
+                                awaitSocksReady()
+                                startTun2Socks()
+                            }
+                            if (TgWsBridge.isEnabled(prefs) && !tgInTunnel(prefs)) {
+                                TgWsBridge.stop()
+                                val ok = TgWsBridge.start(this@ByeDpiVpnService, prefs)
+                                if (ok) {
+                                    TgWsBridge.startWatchdog(
+                                        lifecycleScope, this@ByeDpiVpnService, prefs,
+                                    )
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "network change restart failed", e)
+                        }
+                    }
+                }
+            }
+            cm.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+        } catch (e: Exception) {
+            Log.w(TAG, "registerDefaultNetworkCallback failed", e)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+        networkCallback = null
     }
 
     private suspend fun pause() {
@@ -150,6 +259,7 @@ class ByeDpiVpnService : LifecycleVpnService() {
     private suspend fun stop() {
         Log.i(TAG, "Stopping")
 
+        unregisterNetworkCallback()
         mutex.withLock {
             stopping = true
             try {
@@ -220,26 +330,35 @@ class ByeDpiVpnService : LifecycleVpnService() {
 
         val sharedPreferences = getPreferences()
         val port = sharedPreferences.getString("byedpi_proxy_port", null)?.toInt() ?: 1080
-        // Fake-IP DNS inside hev (mapdns) — no UDP DNS through SOCKS/ByeDPI
-        val dns = "198.18.0.2"
+        // Fake-IP DNS inside hev (mapdns) — no UDP DNS through SOCKS/ByeDPI.
+        // Some networks choke on fake-IP; dns_mode=system falls back to a real
+        // resolver so the user is not stuck with a broken tunnel.
+        val useMapDns = sharedPreferences.getBoolean("obhod_dns_mapdns", true)
+        val dns = if (useMapDns) {
+            "198.18.0.2"
+        } else {
+            sharedPreferences.getString("dns_ip", "1.1.1.1")?.ifBlank { "1.1.1.1" } ?: "1.1.1.1"
+        }
         val ipv6 = sharedPreferences.getBoolean("ipv6_enable", false)
 
-        val tun2socksConfig = """
-        | tunnel:
-        |   mtu: 8500
-        | misc:
-        |   task-stack-size: 81920
-        | socks5:
-        |   address: 127.0.0.1
-        |   port: $port
-        |   udp: udp
-        | mapdns:
-        |   address: 198.18.0.2
-        |   port: 53
-        |   network: 100.64.0.0
-        |   netmask: 255.192.0.0
-        |   cache-size: 10000
-        """.trimMargin("| ")
+        val tun2socksConfig = buildString {
+            appendLine("tunnel:")
+            appendLine("  mtu: 8500")
+            appendLine("misc:")
+            appendLine("  task-stack-size: 81920")
+            appendLine("socks5:")
+            appendLine("  address: 127.0.0.1")
+            appendLine("  port: $port")
+            appendLine("  udp: udp")
+            if (useMapDns) {
+                appendLine("mapdns:")
+                appendLine("  address: 198.18.0.2")
+                appendLine("  port: 53")
+                appendLine("  network: 100.64.0.0")
+                appendLine("  netmask: 255.192.0.0")
+                appendLine("  cache-size: 10000")
+            }
+        }
 
         val configPath = try {
             File.createTempFile("config", "tmp", cacheDir).apply {
@@ -250,7 +369,7 @@ class ByeDpiVpnService : LifecycleVpnService() {
             throw e
         }
 
-        val fd = createBuilder(dns, ipv6).establish()
+        val fd = createBuilder(dns, ipv6, useMapDns).establish()
             ?: throw IllegalStateException("VPN connection failed")
 
         this.tunFd = fd
@@ -260,7 +379,7 @@ class ByeDpiVpnService : LifecycleVpnService() {
             throw IllegalStateException("hev-socks5-tunnel failed to start")
         }
 
-        Log.i(TAG, "Tun2Socks started (mapdns=198.18.0.2)")
+        Log.i(TAG, "Tun2Socks started (dns=$dns mapdns=$useMapDns)")
     }
 
     private fun stopTun2Socks() {
@@ -328,8 +447,8 @@ class ByeDpiVpnService : LifecycleVpnService() {
             paused = status == ServiceStatus.Paused,
         )
 
-    private fun createBuilder(dns: String, ipv6: Boolean): Builder {
-        Log.d(TAG, "DNS: $dns")
+    private fun createBuilder(dns: String, ipv6: Boolean, mapDns: Boolean = true): Builder {
+        Log.d(TAG, "DNS: $dns (mapDns=$mapDns)")
         val builder = Builder()
         builder.setSession("Ласточка")
         builder.setConfigureIntent(
@@ -350,7 +469,10 @@ class ByeDpiVpnService : LifecycleVpnService() {
                 .addRoute("::", 0)
         }
 
-        if (dns.isNotBlank()) {
+        if (mapDns) {
+            // Fake-IP resolver lives inside hev; the system must send DNS there.
+            builder.addDnsServer("198.18.0.2")
+        } else if (dns.isNotBlank()) {
             builder.addDnsServer(dns)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -361,12 +483,16 @@ class ByeDpiVpnService : LifecycleVpnService() {
 
         builder.addDisallowedApplication(applicationContext.packageName)
 
-        // Telegram uses local MTProto WS on :1082 — must bypass VPN tun
-        for (pkg in TgWsBridge.telegramPackages) {
-            try {
-                builder.addDisallowedApplication(pkg)
-            } catch (_: Exception) {
-                // not installed
+        // Telegram uses local MTProto WS on :1082 — it must bypass the tun
+        // ONLY while the bridge is actually running. In "Telegram through the
+        // tunnel" mode we keep it inside so MTProto rides the ByeDPI desync.
+        if (!tgInTunnel(getPreferences())) {
+            for (pkg in TgWsBridge.telegramPackages) {
+                try {
+                    builder.addDisallowedApplication(pkg)
+                } catch (_: Exception) {
+                    // not installed
+                }
             }
         }
 

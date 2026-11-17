@@ -34,7 +34,9 @@ object AppUpdater {
     private const val PREF_LAST_CHECK = "obhod_update_last_check"
     private const val PREF_WHATS_NEW = "obhod_whats_new_pending"
     private const val PREF_WHATS_NEW_CODE = "obhod_whats_new_code"
-    private const val PREF_SEEN_WHATS_NEW = "obhod_whats_new_seen_code"
+    private const val PREF_SEEN_WHATS_NEW = "obhod_whats_new_seen"
+    private const val PREF_PENDING_APK = "obhod_update_pending_apk"
+    private const val PREF_PENDING_RELEASE_JSON = "obhod_update_pending_release"
 
     data class ReleaseInfo(
         val versionName: String,
@@ -105,7 +107,7 @@ object AppUpdater {
             val json = JSONObject(body)
             val tag = json.optString("tag_name", "").removePrefix("v").trim()
             val html = json.optString("html_url", "")
-            val notes = json.optString("body", "").take(1200)
+            val notes = formatReleaseNotes(json.optString("body", ""))
             val assets = json.optJSONArray("assets") ?: return CheckResult(true, "Обновлений нет")
             var apkUrl = ""
             var apkSize = 0L
@@ -247,6 +249,67 @@ object AppUpdater {
         return notes
     }
 
+    fun rememberPendingInstall(context: Context, apk: File, release: ReleaseInfo) {
+        val json = JSONObject()
+            .put("versionName", release.versionName)
+            .put("versionCode", release.versionCode)
+            .put("apkUrl", release.apkUrl)
+            .put("htmlUrl", release.htmlUrl)
+            .put("notes", release.notes)
+            .put("apkSizeBytes", release.apkSizeBytes)
+            .toString()
+        context.getSharedPreferences(context.packageName + "_preferences", Context.MODE_PRIVATE)
+            .edit()
+            .putString(PREF_PENDING_APK, apk.absolutePath)
+            .putString(PREF_PENDING_RELEASE_JSON, json)
+            .apply()
+    }
+
+    fun clearPendingInstall(context: Context) {
+        context.getSharedPreferences(context.packageName + "_preferences", Context.MODE_PRIVATE)
+            .edit()
+            .remove(PREF_PENDING_APK)
+            .remove(PREF_PENDING_RELEASE_JSON)
+            .apply()
+    }
+
+    fun pendingApk(context: Context): File? {
+        val path = context.getSharedPreferences(
+            context.packageName + "_preferences",
+            Context.MODE_PRIVATE,
+        ).getString(PREF_PENDING_APK, null) ?: return null
+        val f = File(path)
+        return f.takeIf { it.exists() && it.length() > 100_000 }
+    }
+
+    fun pendingRelease(context: Context): ReleaseInfo? {
+        val raw = context.getSharedPreferences(
+            context.packageName + "_preferences",
+            Context.MODE_PRIVATE,
+        ).getString(PREF_PENDING_RELEASE_JSON, null) ?: return null
+        return try {
+            val j = JSONObject(raw)
+            ReleaseInfo(
+                versionName = j.optString("versionName"),
+                versionCode = j.optInt("versionCode"),
+                apkUrl = j.optString("apkUrl"),
+                htmlUrl = j.optString("htmlUrl"),
+                notes = j.optString("notes"),
+                apkSizeBytes = j.optLong("apkSizeBytes"),
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun canInstallPackages(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.packageManager.canRequestPackageInstalls()
+        } else {
+            true
+        }
+    }
+
     fun installApk(activity: Activity, apk: File): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             !activity.packageManager.canRequestPackageInstalls()
@@ -314,6 +377,28 @@ object AppUpdater {
         if (bytes <= 0) return "?"
         val mb = bytes / (1024.0 * 1024.0)
         return if (mb >= 1) "%.1f МБ".format(mb) else "%.0f КБ".format(bytes / 1024.0)
+    }
+
+    /**
+     * GitHub release body is Markdown; the in-app dialog shows plain text.
+     * Strip headings/bold/code so users don't see ## or broken `versionCode`.
+     */
+    fun formatReleaseNotes(raw: String): String {
+        if (raw.isBlank()) return ""
+        return raw.lineSequence()
+            .map { line ->
+                line.trim()
+                    .replace(Regex("^#{1,6}\\s*"), "")
+                    .replace(Regex("\\*\\*(.+?)\\*\\*"), "$1")
+                    .replace(Regex("__(.+?)__"), "$1")
+                    .replace(Regex("`([^`]+)`"), "$1")
+                    .replace(Regex("^[-*]\\s+"), "• ")
+            }
+            .filter { it.isNotBlank() }
+            .filterNot { it.matches(Regex("(?i)^versionCode\\s*:.*")) }
+            .joinToString("\n")
+            .take(900)
+            .trim()
     }
 
     private fun isNewerName(remote: String, local: String): Boolean {

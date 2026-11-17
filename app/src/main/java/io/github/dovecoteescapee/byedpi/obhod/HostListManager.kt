@@ -151,6 +151,20 @@ object HostListManager {
     )
 
     /**
+     * Schedule site API/storage (chuikov-rasp) — Cloudflare Workers + Supabase.
+     * Same class as Discord/CF: harsh desync RSTs the edge. Tunnel only (-An).
+     */
+    val RASP_PASS_DOMAINS = listOf(
+        "workers.dev",
+        "pages.dev",
+        "supabase.co",
+        "github.io",
+        "pepsicolaq.github.io",
+        "azuergqxvqrkvrvqelha.supabase.co",
+        "rasp-supabase-proxy.tourmaline-purchase.workers.dev",
+    )
+
+    /**
      * Discord family — tunnel + public DNS resolve only.
      * Must NOT appear in desync (-H) list: fake/split/tlsrec RSTs Cloudflare.
      */
@@ -177,6 +191,28 @@ object HostListManager {
     fun listsDir(context: Context): File =
         File(context.filesDir, "lists").also { if (!it.exists()) it.mkdirs() }
 
+    /**
+     * Cloudflare front domains used by TG WS bridge (Flowseal list).
+     *
+     * The upstream file stores these names obfuscated (see [CfProxyDomains]).
+     * They MUST be decoded before they go into the `-H` desync list: the raw
+     * encoded strings never appear in a real ClientHello, so the CF path used
+     * to be dialled without desync and the DPI reset the handshake.
+     *
+     * Only domains that actually resolve are returned, and `userDomain`
+     * (settings) takes precedence, so a user can point the bridge at their
+     * own Cloudflare zone.
+     */
+    fun cfProxyDomains(context: Context, userDomain: String = ""): List<String> =
+        CfProxyDomains.allDomains(context, CfProxyDomains.userDomains(userDomain))
+
+    /**
+     * Same as [cfProxyDomains], but verified live. Empty result means the CF
+     * path is unusable right now and the bridge should stay direct.
+     */
+    fun liveCfProxyDomains(context: Context, userDomain: String = ""): List<String> =
+        CfProxyDomains.workingDomains(context, CfProxyDomains.userDomains(userDomain))
+
     fun ensureBundledLists(context: Context) {
         val dir = listsDir(context)
         val names = listOf("seed.txt", "google.txt", "exclude.txt", "auto.txt")
@@ -192,24 +228,46 @@ object HostListManager {
                 if (!out.exists()) out.writeText("# $name\n")
             }
         }
+        // Старые установки не перезаписывают exclude.txt — дописываем обязательные домены
+        mergeRequiredExcludes(File(dir, "exclude.txt"))
+    }
+
+    private fun mergeRequiredExcludes(file: File) {
+        val required = (RASP_PASS_DOMAINS + listOf(
+            "cloudflare.com", "cloudfront.net", "workers.dev", "pages.dev",
+            "supabase.co", "github.io",
+        )).map { it.lowercase() }.distinct()
+        val existing = parseDomains(file).toMutableSet()
+        var changed = false
+        for (d in required) {
+            if (d !in existing) {
+                existing.add(d)
+                changed = true
+            }
+        }
+        if (!changed && file.exists() && file.length() > 0) return
+        val header = "# Domains that should never be processed by DPI bypass\n"
+        file.writeText(header + existing.sorted().joinToString("\n") + "\n")
     }
 
     /** Full list for UI / prefs; includes Discord (for diagnostics). */
-    fun buildWhitelist(context: Context): String {
+    fun buildWhitelist(context: Context, userDomain: String = ""): String {
         val all = linkedSetOf<String>()
-        all.addAll(buildDesyncDomains(context))
+        all.addAll(buildDesyncDomains(context, userDomain))
         DISCORD_DOMAINS.forEach { all.add(it.lowercase()) }
         GEMINI_DOMAINS.forEach { all.add(it.lowercase()) }
+        RASP_PASS_DOMAINS.forEach { all.add(it.lowercase()) }
         META_DOMAINS.forEach { all.add(it.lowercase()) }
         TELEGRAM_EXTRA.forEach { all.add(it.lowercase()) }
+        cfProxyDomains(context, userDomain).forEach { all.add(it) }
         return all.sorted().joinToString("\n")
     }
 
     /** Domains that receive ByeDPI TLS desync (-H file). */
-    fun buildDesyncWhitelist(context: Context): String =
-        buildDesyncDomains(context).sorted().joinToString("\n")
+    fun buildDesyncWhitelist(context: Context, userDomain: String = ""): String =
+        buildDesyncDomains(context, userDomain).sorted().joinToString("\n")
 
-    private fun buildDesyncDomains(context: Context): Set<String> {
+    private fun buildDesyncDomains(context: Context, userDomain: String = ""): Set<String> {
         ensureBundledLists(context)
         val dir = listsDir(context)
         val domains = linkedSetOf<String>()
@@ -221,12 +279,19 @@ object HostListManager {
         val exclude = parseDomains(File(dir, "exclude.txt")).toSet()
         val discord = DISCORD_DOMAINS.map { it.lowercase() }.toSet()
         val gemini = GEMINI_DOMAINS.map { it.lowercase() }.toSet()
+        val rasp = RASP_PASS_DOMAINS.map { it.lowercase() }.toSet()
         val meta = META_DOMAINS.map { it.lowercase() }.toSet()
+        // Decoded CF fronts are handled by their own -H group, never here.
+        val cf = cfProxyDomains(context, userDomain).toSet()
         return domains
             .filter { it !in exclude && it != "localhost" }
             .filter { !it.contains("cloudflare") && it != "cloudfront.net" }
+            .filter { !it.endsWith("workers.dev") && !it.endsWith("pages.dev") }
+            .filter { !it.endsWith("supabase.co") && !it.endsWith("github.io") }
+            .filter { it !in rasp && rasp.none { r -> it == r || it.endsWith(".$r") } }
             .filter { it !in discord && !it.contains("discord") }
             .filter { it !in gemini }
+            .filter { it !in cf }
             .filter { d -> !meta.any { m -> d == m || d.endsWith(".$m") } }
             .filter { d ->
                 // Catch CDN variants from community lists

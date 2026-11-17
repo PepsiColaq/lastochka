@@ -26,6 +26,10 @@ object StrategyPresets {
     const val PREF_AUTO_NETWORK = "obhod_auto_network_strategy"
     const val PREF_TG_WS = "obhod_tg_ws_enabled"
     const val PREF_AUTO_START = "obhod_auto_start_vpn"
+    /** Own Cloudflare zone for the TG bridge (comma separated). */
+    const val PREF_CF_USER_DOMAIN = "obhod_cf_user_domain"
+    /** Fall back to sending Telegram MTProto through the ByeDPI tunnel. */
+    const val PREF_TG_IN_TUNNEL = "obhod_tg_in_tunnel"
 
     /** Default — works on Tele2; also a solid baseline for other RU LTE/Wi‑Fi. */
     val Universal = StrategyPreset(
@@ -39,19 +43,38 @@ object StrategyPresets {
         id = "soft",
         title = "Мягкая",
         description = "Если Универсальная ломает сайты (часто Wi‑Fi / другой оператор)",
-        cmdArgs = "-U -d1 -s1 -An -Kt,h",
+        // NOTE: no embedded -An here. An "-An" inside the body opened an empty
+        // auto group that swallowed every rule after it (old bug).
+        cmdArgs = "-U -d1 -s1 -Kt,h",
     )
 
+    /**
+     * Fake-packet ladder for networks where plain split/disorder is not
+     * enough (МТС/Билайн LTE). Uses `-f` (fake) with a low TTL so the fake
+     * ClientHello dies before reaching the real server, plus OOB for hosts
+     * that ignore fakes.
+     */
     val Aggressive = StrategyPreset(
         id = "aggressive",
         title = "Жёсткая",
-        description = "Сильнее на LTE, если Универсальной мало (МТС/Билайн и т.п.)",
-        cmdArgs = Universal.cmdArgs,
+        description = "Fake + низкий TTL: для LTE, где сплита мало (МТС/Билайн)",
+        cmdArgs = "-U -f1 -t2 -d1+s -s1+s -o1+s -q1 -Kt,h",
+    )
+
+    /**
+     * Narrow profile: desync only what YouTube needs, leave everything else
+     * in passthrough. Use when the broad profile makes other sites flaky.
+     */
+    val YouTubeOnly = StrategyPreset(
+        id = "youtube-only",
+        title = "Только YouTube",
+        description = "Минимальный десинк для YouTube/Google video. Сайты не трогает",
+        cmdArgs = "-U -d1+s -s1+s -q1+s -r1+s -Kt",
     )
 
     val Alt get() = Universal
 
-    val all: List<StrategyPreset> = listOf(Universal, Soft, Aggressive)
+    val all: List<StrategyPreset> = listOf(Universal, Soft, Aggressive, YouTubeOnly)
 
     fun byId(id: String?): StrategyPreset = when (id) {
         null, "flowseal-alt", "universal", "telegram", "fake-tls" -> Universal
@@ -84,6 +107,46 @@ object StrategyPresets {
         }
     }
 
+    /**
+     * Body of the selected preset with the leading `-U` removed.
+     *
+     * `-A*` switches inside the body are **kept**: Universal uses `-As` as a
+     * retry-on-TLS-error ladder, and that is part of the profile that works on
+     * Tele2. Only the leading `-U` belongs to the command, not the group.
+     */
+    private fun presetBody(preset: StrategyPreset): String =
+        preset.cmdArgs.removePrefix("-U").trim()
+
+    /** `-U` + one deterministic group chain: discord → gemini → rasp → meta → cf → yt → passthrough. */
+    private fun buildCommand(
+        preset: StrategyPreset,
+        discordFile: File,
+        geminiFile: File,
+        raspFile: File,
+        metaFile: File,
+        cfFile: File,
+        desyncFile: File,
+    ): String {
+        val ytPart = presetBody(preset)
+        return buildString {
+            append("-U ")
+            // Cloudflare edges (Discord, schedule API): tunnel + DNS only.
+            append("-H ${discordFile.absolutePath} -d1+s -s1+s ")
+            // Gemini / Assistant: harsh multisplit breaks the API.
+            append("-An -H ${geminiFile.absolutePath} ")
+            // Workers / Supabase / Pages: passthrough.
+            append("-An -H ${raspFile.absolutePath} ")
+            // Instagram / X: soft disorder, their edges RST on multisplit.
+            append("-An -H ${metaFile.absolutePath} -d1+s -s1+s ")
+            // Telegram CF fronts (decoded): the path that used to be desync-free.
+            append("-An -H ${cfFile.absolutePath} -d1+s -s1+s ")
+            // Everything YouTube/Google: full preset shape.
+            if (ytPart.isNotEmpty()) append("-An -H ${desyncFile.absolutePath} $ytPart ")
+            // Everyone else: untouched.
+            append("-An")
+        }
+    }
+
     fun applyToPreferences(
         prefs: SharedPreferences,
         preset: StrategyPreset,
@@ -96,31 +159,46 @@ object StrategyPresets {
                 val full = hostsWhitelist.ifBlank { HostListManager.buildWhitelist(context) }
                 val desync = HostListManager.buildDesyncWhitelist(context)
                 File(HostListManager.listsDir(context), "whitelist.txt").writeText(full)
-                val desyncFile = File(HostListManager.listsDir(context), "desync.txt").also { it.writeText(desync) }
+                val desyncFile = File(HostListManager.listsDir(context), "desync.txt").also {
+                    it.writeText(desync)
+                }
                 val discordFile = File(HostListManager.listsDir(context), "discord.txt").also {
                     it.writeText(
-                        HostListManager.DISCORD_DOMAINS.map { d -> d.lowercase() }.distinct().sorted().joinToString("\n"),
+                        HostListManager.DISCORD_DOMAINS.map { d -> d.lowercase() }.distinct().sorted()
+                            .joinToString("\n"),
                     )
                 }
                 val geminiFile = File(HostListManager.listsDir(context), "gemini.txt").also {
                     it.writeText(
-                        HostListManager.GEMINI_DOMAINS.map { d -> d.lowercase() }.distinct().sorted().joinToString("\n"),
+                        HostListManager.GEMINI_DOMAINS.map { d -> d.lowercase() }.distinct().sorted()
+                            .joinToString("\n"),
+                    )
+                }
+                val raspFile = File(HostListManager.listsDir(context), "rasp.txt").also {
+                    it.writeText(
+                        HostListManager.RASP_PASS_DOMAINS.map { d -> d.lowercase() }.distinct().sorted()
+                            .joinToString("\n"),
                     )
                 }
                 val metaFile = File(HostListManager.listsDir(context), "meta.txt").also {
                     it.writeText(
-                        HostListManager.META_DOMAINS.map { d -> d.lowercase() }.distinct().sorted().joinToString("\n"),
+                        HostListManager.META_DOMAINS.map { d -> d.lowercase() }.distinct().sorted()
+                            .joinToString("\n"),
                     )
                 }
-                // Order: Discord mild → Gemini pass → Meta/X soft → YT multisplit → passthrough
-                val ytPart = preset.cmdArgs.removePrefix("-U ").trimStart()
-                cmd = "-U " +
-                    "-H ${discordFile.absolutePath} -d1+s -s1+s " +
-                    "-An -H ${geminiFile.absolutePath} " +
-                    "-An -H ${metaFile.absolutePath} -d1+s -s1+s " +
-                    "-An -H ${desyncFile.absolutePath} $ytPart " +
-                    "-An"
-                Log.i(TAG, "strategy=${preset.id} discord+gemini+meta-soft+yt")
+                // Decoded Cloudflare fronts (see CfProxyDomains). These are the
+                // hosts the Telegram bridge actually dials.
+                val cfUserDomain = prefs.getString(PREF_CF_USER_DOMAIN, "") ?: ""
+                val cfFile = File(HostListManager.listsDir(context), "cfproxy.txt").also {
+                    it.writeText(
+                        HostListManager.cfProxyDomains(context, cfUserDomain)
+                            .distinct().sorted().joinToString("\n"),
+                    )
+                }
+                cmd = buildCommand(
+                    preset, discordFile, geminiFile, raspFile, metaFile, cfFile, desyncFile,
+                )
+                Log.i(TAG, "strategy=${preset.id} groups=discord,gemini,rasp,meta,cf,yt,passthrough")
             } catch (e: Exception) {
                 Log.w(TAG, "whitelist write", e)
             }

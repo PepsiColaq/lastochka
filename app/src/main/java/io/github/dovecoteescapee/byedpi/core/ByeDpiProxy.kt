@@ -24,7 +24,9 @@ class ByeDpiProxy {
     suspend fun stopProxy(): Int {
         mutex.withLock {
             if (fd < 0) {
-                throw IllegalStateException("Proxy is not running")
+                // Nothing to stop. Used to throw, which crashed the service
+                // during teardown after a partially-failed start.
+                return 0
             }
 
             val result = jniStopProxy(fd)

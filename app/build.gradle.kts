@@ -12,8 +12,8 @@ android {
         applicationId = "ru.obhod.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 8
+        versionName = "1.0.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -49,7 +49,12 @@ android {
         debug {
             buildConfigField("String", "VERSION_NAME", "\"${defaultConfig.versionName}-debug\"")
             buildConfigField("String", "UPDATE_REPO", "\"PepsiColaq/lastochka\"")
-            applicationIdSuffix = ".debug"
+            // Same applicationId + release signature as GitHub APK,
+            // so «Проверить обновление» обновляет это же приложение, а не ставит второе.
+            val keystoreFile = rootProject.file("keystore/obhod-release.jks")
+            if (keystoreFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         release {
             buildConfigField("String", "VERSION_NAME", "\"${defaultConfig.versionName}\"")
