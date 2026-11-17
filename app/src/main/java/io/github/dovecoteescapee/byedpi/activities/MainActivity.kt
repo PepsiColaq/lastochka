@@ -108,6 +108,7 @@ class MainActivity : ComponentActivity() {
     private var uiTgInTunnel by mutableStateOf(false)
     private var uiDiagnostics by mutableStateOf<List<String>?>(null)
     private var uiDiagnosing by mutableStateOf(false)
+    private var uiCrashReport by mutableStateOf<String?>(null)
 
     private val vpnRegister =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -141,18 +142,43 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val prefs = getPreferences()
-        uiStrategyId = prefs.getString(StrategyPresets.PREF_STRATEGY_ID, StrategyPresets.Universal.id)
-            ?: StrategyPresets.Universal.id
-        uiAutoNetwork = prefs.getBoolean(StrategyPresets.PREF_AUTO_NETWORK, false)
-        uiAutoStart = prefs.getBoolean(StrategyPresets.PREF_AUTO_START, false)
-        uiTgWs = prefs.getBoolean(StrategyPresets.PREF_TG_WS, true)
-        uiDarkTheme = prefs.getBoolean("obhod_dark_theme", true)
-        uiWhatsNew = AppUpdater.consumeWhatsNew(this)
-        uiCfDomain = prefs.getString(StrategyPresets.PREF_CF_USER_DOMAIN, "") ?: ""
-        uiTgInTunnel = prefs.getBoolean(StrategyPresets.PREF_TG_IN_TUNNEL, false)
+        // A corrupt or legacy preference value must never crash the UI at
+        // launch (e.g. a string stored where a boolean is now expected).
+        try {
+            val prefs = getPreferences()
+            uiStrategyId = prefs.getString(StrategyPresets.PREF_STRATEGY_ID, StrategyPresets.Universal.id)
+                ?: StrategyPresets.Universal.id
+            uiAutoNetwork = prefs.getBoolean(StrategyPresets.PREF_AUTO_NETWORK, false)
+            uiAutoStart = prefs.getBoolean(StrategyPresets.PREF_AUTO_START, false)
+            uiTgWs = prefs.getBoolean(StrategyPresets.PREF_TG_WS, true)
+            uiDarkTheme = prefs.getBoolean("obhod_dark_theme", true)
+            uiCfDomain = prefs.getString(StrategyPresets.PREF_CF_USER_DOMAIN, "") ?: ""
+            uiTgInTunnel = prefs.getBoolean(StrategyPresets.PREF_TG_IN_TUNNEL, false)
+        } catch (e: Throwable) {
+            Log.e(TAG, "prefs init failed, using defaults", e)
+        }
 
-        HostListManager.ensureBundledLists(this)
+        try {
+            uiWhatsNew = AppUpdater.consumeWhatsNew(this)
+        } catch (e: Throwable) {
+            Log.w(TAG, "consumeWhatsNew failed", e)
+        }
+
+        try {
+            HostListManager.ensureBundledLists(this)
+        } catch (e: Throwable) {
+            Log.w(TAG, "ensureBundledLists failed", e)
+        }
+
+        // If the last process died, show what happened — the user can copy it
+        // and send it over instead of guessing "not turning on".
+        try {
+            if (io.github.dovecoteescapee.byedpi.obhod.Diag.crashLog(this).isNotBlank()) {
+                uiCrashReport = io.github.dovecoteescapee.byedpi.obhod.LastochkaApp.report(this)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "crash report read failed", e)
+        }
 
         val intentFilter = IntentFilter().apply {
             addAction(STARTED_BROADCAST)
@@ -208,6 +234,11 @@ class MainActivity : ComponentActivity() {
                     tgInTunnel = uiTgInTunnel,
                     diagnostics = uiDiagnostics,
                     diagnosing = uiDiagnosing,
+                    crashReport = uiCrashReport,
+                    onDismissCrash = {
+                        uiCrashReport = null
+                        io.github.dovecoteescapee.byedpi.obhod.Diag.clear(this@MainActivity)
+                    },
                     onToggle = { toggleBypass() },
                     onStrategyChange = { id ->
                         uiStrategyId = id
@@ -698,6 +729,8 @@ private fun ObhodScreen(
     tgInTunnel: Boolean,
     diagnostics: List<String>?,
     diagnosing: Boolean,
+    crashReport: String?,
+    onDismissCrash: () -> Unit,
     onToggle: () -> Unit,
     onStrategyChange: (String) -> Unit,
     onAutoNetworkChange: (Boolean) -> Unit,
@@ -748,6 +781,38 @@ private fun ObhodScreen(
             },
             confirmButton = {
                 TextButton(onClick = onDismissWhatsNew) { Text("Отлично") }
+            },
+        )
+    }
+
+    if (!crashReport.isNullOrBlank()) {
+        AlertDialog(
+            onDismissRequest = onDismissCrash,
+            title = { Text("Прошлый запуск завершился сбоем") },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    Text(
+                        "Пришлите этот текст разработчику — по нему видно, " +
+                            "на каком шаге упало.",
+                        fontSize = 13.sp,
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (darkTheme) Color(0xFF101815) else Color(0xFFE6EEF2),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = crashReport.take(1800),
+                            fontSize = 11.sp,
+                            color = muted,
+                            modifier = Modifier.padding(10.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onDismissCrash) { Text("Закрыть") }
             },
         )
     }

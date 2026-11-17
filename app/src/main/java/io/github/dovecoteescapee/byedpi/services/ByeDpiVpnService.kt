@@ -18,6 +18,7 @@ import io.github.dovecoteescapee.byedpi.core.ByeDpiProxyPreferences
 import io.github.dovecoteescapee.byedpi.core.TProxyService
 import io.github.dovecoteescapee.byedpi.data.*
 import io.github.dovecoteescapee.byedpi.obhod.CfProxyDomains
+import io.github.dovecoteescapee.byedpi.obhod.Diag
 import io.github.dovecoteescapee.byedpi.obhod.HostListManager
 import io.github.dovecoteescapee.byedpi.obhod.StrategyPresets
 import io.github.dovecoteescapee.byedpi.utility.*
@@ -30,6 +31,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.coroutineContext
 import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -40,6 +43,7 @@ class ByeDpiVpnService : LifecycleVpnService() {
     private var tunFd: ParcelFileDescriptor? = null
     private val mutex = Mutex()
     private var stopping: Boolean = false
+    private var starting: Boolean = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     companion object {
@@ -63,17 +67,45 @@ class ByeDpiVpnService : LifecycleVpnService() {
         super.onStartCommand(intent, flags, startId)
         return when (val action = intent?.action) {
             START_ACTION, RESUME_ACTION -> {
-                lifecycleScope.launch { start() }
+                // Android may deliver several start intents in a row (quick
+                // tile, widget, auto-start). Two concurrent start() bodies
+                // raced on the mutex and the loser threw "Proxy fields not
+                // null", which used to take the whole process down.
+                if (!starting) {
+                    starting = true
+                    lifecycleScope.launch {
+                        try {
+                            start()
+                        } catch (e: Throwable) {
+                            Log.e(TAG, "start() crashed", e)
+                            safelyMarkFailed()
+                        } finally {
+                            starting = false
+                        }
+                    }
+                }
                 START_STICKY
             }
 
             PAUSE_ACTION -> {
-                lifecycleScope.launch { pause() }
+                lifecycleScope.launch {
+                    try {
+                        pause()
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "pause() crashed", e)
+                    }
+                }
                 START_STICKY
             }
 
             STOP_ACTION -> {
-                lifecycleScope.launch { stop() }
+                lifecycleScope.launch {
+                    try {
+                        stop()
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "stop() crashed", e)
+                    }
+                }
                 START_NOT_STICKY
             }
 
@@ -84,6 +116,26 @@ class ByeDpiVpnService : LifecycleVpnService() {
         }
     }
 
+    /**
+     * Best-effort "give up" path. If the exception happened before
+     * startForeground(), Android would otherwise kill the process with
+     * RemoteServiceException; stopping ourselves first is the clean exit.
+     */
+    private suspend fun safelyMarkFailed() {
+        try {
+            startForeground()
+        } catch (_: Throwable) {
+        }
+        try {
+            updateStatus(ServiceStatus.Failed)
+        } catch (_: Throwable) {
+        }
+        try {
+            stopSelf()
+        } catch (_: Throwable) {
+        }
+    }
+
     override fun onRevoke() {
         Log.i(TAG, "VPN revoked")
         lifecycleScope.launch { stop() }
@@ -91,29 +143,57 @@ class ByeDpiVpnService : LifecycleVpnService() {
 
     private suspend fun start() {
         Log.i(TAG, "Starting")
+        Diag.startSession(this)
+        Diag.mark(this, "service.start begin status=$status")
 
         if (status == ServiceStatus.Connected) {
             Log.w(TAG, "VPN already connected")
+            Diag.mark(this, "service.start skipped: already connected")
             return
         }
 
+        // CRITICAL: startForeground() must happen within ~5 s of
+        // startForegroundService(), otherwise Android kills the whole process
+        // with RemoteServiceException — the user sees "app crashes on launch".
+        // 1.0.7 called it *after* awaitSocksReady() (up to 5 s), so this is
+        // done first, unconditionally, before any slow work.
         try {
-            mutex.withLock {
-                startProxy()
-                // hev-socks5-tunnel needs ByeDPI listening. Without this wait
-                // the TUN could come up before :1080 existed and the first
-                // connections went nowhere.
-                awaitSocksReady()
-                startTun2Socks()
+            startForeground()
+            Diag.mark(this, "service.start foreground ok")
+        } catch (e: Throwable) {
+            Log.e(TAG, "startForeground failed", e)
+            Diag.mark(this, "service.start foreground FAILED: $e")
+        }
+
+        try {
+            // Proxy and TUN setup block; keep them off the main thread.
+            Diag.mark(this, "service.start proxy+tun begin")
+            withContext(Dispatchers.IO) {
+                mutex.withLock {
+                    startProxy()
+                    Diag.mark(this@ByeDpiVpnService, "service.start proxy up")
+                    // hev-socks5-tunnel needs ByeDPI listening. Without this wait
+                    // the TUN could come up before :1080 existed and the first
+                    // connections went nowhere.
+                    awaitSocksReady()
+                    startTun2Socks()
+                    Diag.mark(this@ByeDpiVpnService, "service.start tun up")
+                }
             }
             // TG WS + watchdog (CF blips used to leave Telegram on a dead proxy)
             val prefs = getPreferences()
             if (TgWsBridge.isEnabled(prefs) && !tgInTunnel(prefs)) {
+                Diag.mark(this, "service.start tg bridge begin")
                 lifecycleScope.launch(Dispatchers.IO) {
-                    val ok = TgWsBridge.start(this@ByeDpiVpnService, prefs)
-                    Log.i(TAG, "TG WS start result=$ok running=${TgWsBridge.running}")
-                    if (ok) {
-                        TgWsBridge.startWatchdog(lifecycleScope, this@ByeDpiVpnService, prefs)
+                    try {
+                        val ok = TgWsBridge.start(this@ByeDpiVpnService, prefs)
+                        Log.i(TAG, "TG WS start result=$ok running=${TgWsBridge.running}")
+                        if (ok) {
+                            TgWsBridge.startWatchdog(lifecycleScope, this@ByeDpiVpnService, prefs)
+                        }
+                    } catch (e: Throwable) {
+                        // The bridge is a nice-to-have: never let it fail the VPN.
+                        Log.e(TAG, "TG WS bridge crashed", e)
                     }
                 }
             } else if (tgInTunnel(prefs)) {
@@ -123,8 +203,10 @@ class ByeDpiVpnService : LifecycleVpnService() {
             updateStatus(ServiceStatus.Connected)
             startForeground()
             registerNetworkCallback()
-        } catch (e: Exception) {
+            Diag.mark(this, "service.start done: connected")
+        } catch (e: Throwable) {
             Log.e(TAG, "Failed to start VPN", e)
+            Diag.mark(this, "service.start FAILED: ${e.javaClass.simpleName}: ${e.message}")
             updateStatus(ServiceStatus.Failed)
             stop()
         }
@@ -288,18 +370,34 @@ class ByeDpiVpnService : LifecycleVpnService() {
         val preferences = getByeDpiPreferences()
 
         proxyJob = lifecycleScope.launch(Dispatchers.IO) {
-            val code = byeDpiProxy.startProxy(preferences)
+            val startedAt = System.currentTimeMillis()
+            val code = try {
+                byeDpiProxy.startProxy(preferences)
+            } catch (e: Throwable) {
+                Log.e(TAG, "proxy threw", e)
+                -1
+            }
+            val aliveMs = System.currentTimeMillis() - startedAt
 
-            withContext(Dispatchers.Main) {
-                if (code != 0) {
-                    Log.e(TAG, "Proxy stopped with code $code")
+            // startProxy only returns when the proxy exits. The old code called
+            // stop() right here, which joins this very job (self-join → ANR /
+            // frozen service). Do the teardown on a separate coroutine.
+            Log.i(TAG, "Proxy loop exited code=$code after ${aliveMs}ms")
+            Diag.mark(this@ByeDpiVpnService, "proxy exited code=$code after ${aliveMs}ms")
+            if (stopping) return@launch
+
+            // Dying within a couple of seconds means it never worked at all:
+            // bad -H list, port already taken, unparsable args. Reporting
+            // "выключено" here made the app look like it refused to switch on.
+            val neverWorked = code != 0 && aliveMs < 3_000
+            lifecycleScope.launch {
+                if (neverWorked) {
+                    Log.e(TAG, "proxy never came up (code=$code)")
                     updateStatus(ServiceStatus.Failed)
                 } else {
-                    if (!stopping) {
-                        stop()
-                        updateStatus(ServiceStatus.Disconnected)
-                    }
+                    updateStatus(ServiceStatus.Disconnected)
                 }
+                stop()
             }
         }
 
@@ -309,13 +407,24 @@ class ByeDpiVpnService : LifecycleVpnService() {
     private suspend fun stopProxy() {
         Log.i(TAG, "Stopping proxy")
 
-        if (status == ServiceStatus.Disconnected) {
-            Log.w(TAG, "Proxy already disconnected")
-            return
+        try {
+            byeDpiProxy.stopProxy()
+        } catch (e: Throwable) {
+            Log.w(TAG, "stopProxy threw", e)
         }
 
-        byeDpiProxy.stopProxy()
-        proxyJob?.join()
+        // Never join our own job: if stop() was invoked from the proxy job's
+        // own coroutine (which is what happens when the proxy loop exits), the
+        // join would wait for itself and hang the service until ANR.
+        val job = proxyJob
+        val self = coroutineContext[Job]
+        if (job != null && job !== self && job.isActive) {
+            val finished = withTimeoutOrNull(2_000) { job.join() }
+            if (finished == null) {
+                Log.w(TAG, "proxyJob did not finish in 2s, cancelling")
+                job.cancel()
+            }
+        }
         proxyJob = null
 
         Log.i(TAG, "Proxy stopped")
@@ -329,7 +438,7 @@ class ByeDpiVpnService : LifecycleVpnService() {
         }
 
         val sharedPreferences = getPreferences()
-        val port = sharedPreferences.getString("byedpi_proxy_port", null)?.toInt() ?: 1080
+        val port = sharedPreferences.getString("byedpi_proxy_port", null)?.toIntOrNull() ?: 1080
         // Fake-IP DNS inside hev (mapdns) — no UDP DNS through SOCKS/ByeDPI.
         // Some networks choke on fake-IP; dns_mode=system falls back to a real
         // resolver so the user is not stuck with a broken tunnel.
